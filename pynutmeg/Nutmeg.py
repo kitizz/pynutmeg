@@ -5,34 +5,38 @@ import numpy as np
 import os
 import sys
 
-from . import ParallelNutmeg as Parallel
+# from . import ParallelNutmeg as Parallel
 import threading
 import time
 
 import signal
 
+import uuid
+
 
 _nutmegCore = None
 _original_sigint = None
 _address = "tcp://localhost"
-_port = 43686
+_pubport = 43686
+_subport = _pubport + 1
 _timeout = 2000
 
 
-def init(address=_address, port=_port, timeout=_timeout, force=False):
+def init(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
     _core(address, port, timeout, force)
 
 
-def _core(address=_address, port=_port, timeout=_timeout, force=False):
+def _core(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
     global _nutmegCore
 
     if _nutmegCore is None or force:
-        _nutmegCore = Nutmeg(address, port, timeout)
+        _nutmegCore = Nutmeg(address, pub_port, sub_port, timeout)
 
     elif address != _address or \
-            port != _port or \
+            pub_port != _pubport or \
+            sub_port != _subport or \
             timeout != _timeout:
-        print("WARNING: Module's Nutmeg core already exists with different settings. For multiple instances, manually instantiate a Nutmeg object.")
+        print("WARNING: Module's Nutmeg core already exists with different settings. For multiple instances, manually instantiate a Nutmeg.Nutmeg(...) object.")
 
     return _nutmegCore
 
@@ -45,32 +49,43 @@ def figure(handle, figureDef, sync=True):
     return _core().figure(handle, figureDef, sync)
 
 
-def isValidHandle(handle):
-    return _core().isValidHandle(handle)
+def ndarray_to_message(array):
+    header = dict(type=str(array.dtype), shape=array.shape)
+    return header, array.tobytes()
 
 
-def toQmlObject(value, binary=False):
+def to_nutmeg_message(value):
     '''
     Recursively convert any numpy.ndarrays into lists in preparation for
     JSONification.
     '''
+    binary = []
+    binary_data = []
+
+    new_value = _to_nut(value, binary, binary_data)
+    return new_value, binary, binary_data
+
+
+def _to_nut(value, binary, binary_data):
+    ''' Helper method for to_nutmeg_message '''
     if isinstance(value, np.ndarray):
-        # We specify ndarray, because 'tolist' should be faster that iterating
-        if binary:
-            return value
-        elif value.dtype != 'O':  # Check not object type
-            return value.tolist()
+        # Check if the array needs binarizing
+        if value.dtype == 'O':  # Check not object type
+            return _to_nut( value.tolist(), binary, binary_data )
         else:
-            return [toQmlObject(subValue) for subValue in value]
+            header, data = ndarray_to_message(value)
+            label = "$bin{:d}$".format(len(binary))
+            binary.append(header)
+            binary_data.append(data)
+            return label
 
     elif isinstance(value, list):
-        return [toQmlObject(subValue) for subValue in value]
+        new_value = [_to_nut(sub_value, binary, binary_data) for sub_value in value]
+        return new_value
 
     elif isinstance(value, dict):
-        for p in value:
-            # TODO: DEFINITELY remove this binary hack once general binary-izing of arrays is implemented.
-            value[p] = toQmlObject(value[p], binary=(p == 'binary'))
-        return value
+        new_value = { key: _to_nut(sub_value, binary, binary_data) for key, sub_value in value.items() }
+        return new_value
 
     else:
         return value
@@ -95,126 +110,92 @@ def _threaded(fn):
 
 class Nutmeg:
 
-    def __init__(self, address=_address, port=_port, timeout=_timeout, pingperiod=10000):
+    def __init__(self, address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, pingperiod=10000):
         '''
         :param timeout: Timeout in ms
         '''
         self.initialized = False
         self.host = address
-        self.port = port
-        self.address = address + ":" + str(port)
+        self.pub_port = pub_port
+        self.sub_port = sub_port
+        self.pub_address = address + ":" + str(pub_port)
+        self.sub_address = address + ":" + str(sub_port)
         self.timeout = timeout
 
+        self.task_count = 0
+        self.session = uuid.uuid1()
+
         # Create the socket and connect to it.
+        self.running = True
         self.context = zmq.Context()
-        self.socket = None
+        self.pubsock = None
         self.poller = None
         self.reset_socket()
 
-        self.socketLock = threading.Lock()
+        self.socket_lock = threading.Lock()
 
         self.figures = {}
 
-        self.pingperiod = pingperiod/1000
-        self.initialized = self.ping()
-
     def reset_socket(self):
         # Close things if necessary
-        if self.socket is not None:
-            if self.poller is not None:
-                self.poller.unregister(self.socket)
-            self.socket.close()
+        if self.pubsock is not None:
+            # if self.poller is not None:
+            #     self.poller.unregister(self.pubsock)
+            self.pubsock.close()
 
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(self.address)
+        self.pubsock = self.context.socket(zmq.PUB)
+        # self.socket.setsockopt(zmq.LINGER, 0)
+        print("Publishing to:", self.pub_address)
+        self.pubsock.connect(self.pub_address)
 
-        self.poller = zmq.Poller()
-        self.poller.register(self.socket, zmq.POLLIN)
+        # self.poller = zmq.Poller()
+        # self.poller.register(self.socket, zmq.POLLIN)
 
-        # Last time a disconnection occurred
-        self.disconnected_t = time.time()
+        # # Last time a disconnection occurred
+        # self.disconnected_t = time.time()
+        self.running = True
 
     def ready(self):
-        # Don't ping everytime so as not to slow down a program too much if Nutmeg isn't around
-        # But allow constant attempts up to 2seconds after the disconnection
-        if not self.initialized and \
-                (time.time() - self.last_ping > self.pingperiod or time.time() - self.disconnected_t < 2):
-            self.initialized = self.ping()
-        return self.initialized
+        return self.running
+
+    def _publish(self, msg, binary_data):
+        # Check socketlock
+        self.socket_lock.acquire()
+        try:
+            # Inject task ID (thread safe in here)
+            msg['id'] = self.task_count
+            self.task_count += 1
+
+            # Send message
+            print("Sending:", "Nutmeg")
+            self.pubsock.send(b"Nutmeg", flags=zmq.SNDMORE)
+            print("Sending:", msg)
+            self.pubsock.send_json(msg, flags=zmq.SNDMORE)
+            # Then data
+            for data in binary_data:
+                print("Sending binary")
+                self.pubsock.send(data, flags=zmq.SNDMORE, copy=True)
+
+            # Makes code nicer just simply having a "null message"
+            self.pubsock.send(b'')
+
+        except IOError:
+            raise
+
+        finally:
+            self.socket_lock.release()
 
     # @_threaded
-    def set_values(self, handle, *value, **properties):
+    def publish_message(self, msg):
         '''
-        Set properties of handle. It will be assumed that handle is a property
-        itself if *value contains any values.
-
-        :param handle: Handle to an object or property.
-        :param *value: If handle refers to a property directly, the first
-            element of this list will be used.
-        :param **properties: Keyword args defining the property names and their
-            values. Will only be used if *value is empty.
-        :param param: Indicate if these new values are in response to a change
-            in parameter, param.
-        :param binary: Indicate that the provided data is to be sent as binary
+        Process the message for numpy arrays and convert them to Nutmeg-ready
+        message data before sending
         '''
-        if 'param' in properties:
-            param = properties.pop('param')
-        else:
-            param = ""
+        msg, binary_header, binary_data = to_nutmeg_message(msg)
+        msg['binary'] = binary_header
+        msg['session'] = str(self.session)
 
-        if 'sync' in properties:
-            sync = properties.pop('sync')
-        else:
-            sync = True
-
-        if len(value) > 0:
-            handleExpanded = handle.split('.')
-            properties = {handleExpanded[-1]: value[0]}
-            handle = '.'.join( handleExpanded[:-1] )
-
-        else:
-            properties = toQmlObject(properties)
-
-        # Grab the binary property if it exists
-        binaryProps = {}
-        if 'binary' in properties:
-            binaryProps['binary'] = properties.pop('binary')
-
-        if len(properties) > 0:
-            msg = {"handle": handle, "data": properties, "parameter": param, "sync": sync }
-            reply = self.send_recv_json(["sendData", msg])
-            # Error
-            if reply[0] != 0:
-                if isinstance(reply[1], dict):
-                    errmsg = reply[1]['message']
-
-                elif isinstance(reply[1], list):
-                    print(reply[1])
-                    errmsg = '\n'.join([ m[1]['message'] for m in reply[1] ])
-                    if len(reply[1]) > 1:
-                        errmsg = "Multiple errors in Nutmeg:\n" + errmsg
-
-                raise(NutmegException(errmsg))
-
-        if len(binaryProps) > 0:
-            # NB: Kept like this for future generalizations...
-            # TODO: For images, consider this in the future: https://code.google.com/p/lz4/
-            for key in binaryProps:
-                value = binaryProps[key]
-                if type(value) == np.ndarray:
-                    shape = list(value.shape)
-                elif type(value) == bytes:
-                    shape = [len(value)]
-                else:
-                    print(type(value))
-                    raise NutmegException("Error converting %s.%s to binary value. Must be type np.ndarray or bytes" % (handle, key))
-
-                msg = {"handle": handle, "property": key, "parameter": param,  "shape": shape, "sync": sync}
-                reply = self.send_recv_binary(msg, value)
-                # Error
-                if reply[0] != 0:
-                    raise(NutmegException(reply[1]['message']))
+        self._publish(msg, binary_data)
 
     def figure(self, handle, figureDef, sync=True):
         # We're going by the interesting assumption that a file path cannot be
@@ -230,167 +211,63 @@ class Nutmeg:
         else:
             qml = figureDef
 
-        return Figure(_core(), handle, address=self.host, port=self.port, qml=qml, sync=sync)
+        msg = dict(command="SetFigure", target=handle, args=[qml])
+        self.publish_message(msg)
+
+        return Figure(self, handle, address=self.host, pub_port=self.pub_port, qml=qml)
+
+    def set_gui(self, handle, qml):
+        msg = dict(command="SetGui", target=handle, args=[qml])
+        self.publish_message(msg)
+
+    def set_property(self, handle, value):
+        '''
+        Set property at handle
+        '''
+        msg = dict(command="SetProperty", target=handle, args=[value])
+        self.publish_message(msg)
+
+    def set_properties(self, handle, **properties):
+        for name, value in properties.items():
+            self.set_property('.'.join((handle, name)), value)
+
+    def set_parameter(self, handle, value):
+        '''
+        Set property at handle
+        '''
+        msg = dict(command="SetParam", target=handle, args=[value])
+        self.publish_message(msg)
 
     def set_parameters(self, handle, **params):
-        # handle: Figure handle
-        if len(params) == 0:
-            return
-
-        msg = { "handle": handle, "params": params }
-        reply = self.send_recv_json(["setGui", msg])
-
-        if reply[0] != 0:
-            raise(NutmegException(reply[1]['message']))
-
-    def is_valid_handle(self, handle):
-        self.socketLock.acquire()
-        self.send_json(["handleValid", {"handle": handle}])
-        reply = self.recv_json()
-        self.socketLock.release()
-
-        # Reply is 0 if valid, 6 if invalid.
-        return reply[0] == 0
-
-    def send_json(self, msg):
-        self.socket.send_string("json", flags=zmq.SNDMORE)
-        self.socket.send_json(msg)
-
-    def send_binary(self, msg, data):
-        self.socket.send_string("binary", flags=zmq.SNDMORE)
-        self.socket.send_json(msg, flags=zmq.SNDMORE)
-        self.socket.send(data, copy=False)
-
-    def recv_json(self, timeout=None):
-        if timeout is None:
-            timeout = self.timeout
-
-        if self.poller.poll(timeout):
-            return self.socket.recv_json()
-        else:
-            self.reset_socket()
-            self.initialized = False
-            self.disconnected_t = time.time()
-            raise IOError("Timeout receiving response from Nutmeg. Check that %s and \
-%d are the correct host and port." % (self.host, self.port))
-
-    def send_recv_json(self, msg, timeout=None):
-        t = []
-        t.append(time.clock())
-        self.socketLock.acquire()
-        # print(msg)
-        # print("Send receive json timing")
-        t.append(time.clock())
-        self.send_json(msg)
-        try:
-            t.append(time.clock())
-            reply = self.recv_json(timeout)
-            t.append(time.clock())
-        except IOError:
-            # self.socketLock.release()
-            # self.initialized = False
-            raise
-        finally:
-            self.socketLock.release()
-
-        t = 1000*np.array(t)
-        # print("Send receive times:", np.around(t - t[0], decimals=2))
-
-        return reply
-
-    def send_recv_binary(self, msg, data, timeout=None):
-        self.socketLock.acquire()
-        self.send_binary(msg, data)
-        try:
-            reply = self.recv_json(timeout)
-        except IOError:
-            # self.socketLock.release()
-            # self.initialized = False
-            raise
-        finally:
-            self.socketLock.release()
-
-        return reply
-
-    def ping(self, timeout=None):
-        if timeout is None:
-            timeout = self.timeout
-
-        msg = ["ping", {}]
-        self.socketLock.acquire()
-        self.last_ping = time.time()
-        self.send_json(msg)
-        try:
-            self.recv_json(timeout)
-            result = True
-        except IOError:
-            result = False
-        finally:
-            self.socketLock.release()
-
-        return result
+        for name, value in params.items():
+            self.set_parameter('.'.join(handle, name), value)
 
 
 class NutmegObject(object):
     def __init__(self, handle):
         self.handle = handle
 
-    def __getattr__(self, name):
-        newHandle = self.handle + '.' + name
-        if isValidHandle(newHandle):
-            return NutmegObject(newHandle)
-        else:
-            raise(NutmegException("%s has no object with handle, %s" % (self.handle, name)))
+    # def __getattr__(self, name):
+    #     newHandle = self.handle + '.' + name
+    #     if isValidHandle(newHandle):
+    #         return NutmegObject(newHandle)
+    #     else:
+    #         raise(NutmegException("%s has no object with handle, %s" % (self.handle, name)))
 
 
 class Figure(NutmegObject):
-    def __init__(self, nutmeg, handle, address, port, qml, sync=True):
+    def __init__(self, nutmeg, handle, address, pub_port, qml):
         self.nutmeg = nutmeg
         self.handle = handle
         self.qml = qml
         self.parameters = {}
         self.updates = {}
         self.address = address
-        self.updateAddress = address + ":" + str(port)
-
-        self.sync = sync
-
-        self._setlock = threading.Lock()
+        # self.updateAddress = address + ":" + str(port)
+        # self._setlock = threading.Lock()
 
         self.sent = False
-        self.send()
-
-    def send(self):
-        if self.sent:
-            return
-
-        if self.nutmeg.ready():
-            figdef = dict(figureHandle=self.handle, qml=self.qml)
-            # try:
-            reply = self.nutmeg.send_recv_json(["createFigure", figdef])
-            # except IOError as e:
-                # print(e)
-
-        if not self.nutmeg.initialized:
-            print("WARNING: Figure not sent (Nutmeg figure.nutmeg instance not yet initialized).")
-            return
-
-        if reply[0] != 0:  # Error
-            err = reply[1]
-            row, col = err['lineNumber'], err['columnNumber']
-            msg = "At line %d, col %d: %s" % \
-                (row, col, err['message'])
-            raise(QMLException(msg))
-            # return Figure(None, handle, address=self.host, port=self.port)
-
-        else:
-            msg = reply[1]
-            self.handle = msg['figureHandle']
-            self.port = msg['port']
-            self.nutmeg.figures[self.handle] = self
-            self.sent = True
-            self.updateAddress = self.address + ":" + str(self.port)
-            # return fig
+        # self.send()
 
     @_threaded
     def _waitForUpdates(self):
@@ -427,43 +304,7 @@ class Figure(NutmegObject):
         else:
             qml = guiDef
 
-        nutmeg = self.nutmeg  # Helps code readability
-
-        # Note that this method of multithreading sockets is frowned upon in the PyZMQ docs
-        nutmeg.socketLock.acquire()
-        nutmeg.send_json(["createGui", {"figureHandle": self.handle, "qml": qml}])
-        # print("JSON sent...")
-        reply = nutmeg.recv_json()
-        nutmeg.socketLock.release()
-
-        if reply[0] != 0:  # Error
-            err = reply[1]
-            msg = "At line %d, col %d: %s" % \
-                (err['lineNumber'], err['columnNumber'], err['message'])
-            raise(QMLException(msg))
-
-        else:
-            # Reply should contain a mapping of the parameters and their values
-            # Init any updates that suit the new params.
-            msg = reply[1]
-            for p in msg["parameters"]:
-                self.parameters[p] = Parameter(p, value=msg["parameters"][p], changed=0, figure=self)
-            updatesToCall = set()
-            # Just in case updates have already been registered, add them to the
-            # list for initialisation.
-            for p in self.updates:
-                if p in msg["parameters"]:
-                    updatesToCall = updatesToCall.union(self.updates[p])
-
-            # We use a set so updates aren't initialised multiple times
-            for update in updatesToCall:
-                update.initializeParameters(self.parameters)
-
-            # Now that we have a GUI, we need to wait for updates.
-            if len(self.parameters) > 0:
-                self._waitForUpdates()
-
-            return True
+        self.nutmeg.set_gui(qml)
 
     def updateParameter(self, param, value):
         # print("Update Parameter:", param, value)
@@ -491,37 +332,18 @@ class Figure(NutmegObject):
         :param handle: A string to the object or property of interest
         :param properties: A dictionary mapping properties to values or just the property values themselves. If `properties` is not a dictionary, Nutmeg will assume that `handle` points directly to a property.
         '''
-        if not self.nutmeg.ready():
-            self.sent = False
+        full_handle = self.handle + "." + handle
 
-        self.send()
-        if not self.sent:
-            return
+        if len(value) > 1:
+            print("WARNING: Values after first value ignored")
+        if len(value) > 0:
+            if len(properties) > 0:
+                print("WARNING: Keyword arguments ignored")
 
-        self._setlock.acquire()
-        fullHandle = self.handle + "." + handle
-        value = (fullHandle,) + value
+            self.nutmeg.set_property(full_handle, value[0])
 
-        def set_threaded(*args, **kwargs):
-            try:
-                self.nutmeg.set_values(*args, **kwargs)
-                return
-            except IOError as e:
-                print("IOError in Nutmeg core...")
-                # print(e)
-                raise(NutmegException(e))
-            finally:
-                self._setlock.release()
-
-        # if not self.sync:
-        #     thread = threading.Thread(target=set_threaded, args=value, kwargs=properties)
-        #     thread.daemon = False
-        #     thread.start()
-        # else:
-        properties['sync'] = self.sync
-        set_threaded(*value, **properties)
-
-        return
+        else:
+            self.nutmeg.set_properties(full_handle, **properties)
 
     def set_parameters(self, **params):
         self.nutmeg.set_parameters(self.handle, **params)
@@ -530,29 +352,22 @@ class Figure(NutmegObject):
         handle = self.handle + '.' + param
         self.nutmeg.set_parameters(handle, **properties)
 
-    def getParameterValues(self):
-        '''
-        :return: A dictionary of the parameters and their values.
-        '''
-        # TODO
-        pass
+    # def register_update(self, update, handle=""):
+    #     # The update needs to know the figure and handle of the targets
+    #     update.handle = handle
+    #     update.figure = self
+    #     # Add update to the list for each registered parameter
+    #     requiredParamsLoaded = True
+    #     for param in update.params:
+    #         if param not in self.updates:
+    #             self.updates[param] = []
+    #         self.updates[param].append(update)
+    #         # Check if this parameter is loaded
+    #         if requiredParamsLoaded and param not in self.parameters:
+    #             requiredParamsLoaded = False
 
-    def registerUpdate(self, update, handle=""):
-        # The update needs to know the figure and handle of the targets
-        update.handle = handle
-        update.figure = self
-        # Add update to the list for each registered parameter
-        requiredParamsLoaded = True
-        for param in update.params:
-            if param not in self.updates:
-                self.updates[param] = []
-            self.updates[param].append(update)
-            # Check if this parameter is loaded
-            if requiredParamsLoaded and param not in self.parameters:
-                requiredParamsLoaded = False
-
-        if requiredParamsLoaded:
-            update.initializeParameters(self.parameters)
+    #     if requiredParamsLoaded:
+    #         update.initializeParameters(self.parameters)
 
 
 class Parameter():
@@ -618,86 +433,6 @@ class Parameter():
         Call this function whenever the value is changed.
         '''
         self.callbacks.append(callback)
-
-
-class Updater():
-    def __init__(self, params, init=None, update=None, threaded=False):
-        '''
-        :param params: A list of parameter names that this update depends on.
-        '''
-        self.paramNames = params
-        self.init = init
-        self.update = update
-        self.initialized = False
-        self.threaded = threaded
-        # Figure and handle should be defined when the update is registered
-        self.figure = None
-        self.handle = ""
-        self.parameters = {}
-
-        self.eventFunc = None
-        self.eventParams = {}
-        self.eventParam = ""  # Which parameter caused this event
-        self.updateEvent = threading.Event()
-        self._processAndSend()
-
-    @_threaded
-    def _processAndSend(self):
-        ''' Wait until an update needs to be called. Call it in a separate
-        process (because GIL), send back the result, and wait for another. '''
-        while True:
-            # When the event triggers, let's roll.
-            print("Update waiting %s" % self.paramNames)
-            self.updateEvent.wait()
-            # Clear the event func and parameters to clean things up
-            func, self.eventFunc = self.eventFunc, None
-            self.updateEvent.clear()
-
-            # Need to {param: value} pairs for the function updates.
-            params = {p: self.parameters[p].value for p in self.parameters}
-
-            print("Received event. Threaded %d" % self.threaded)
-
-            if self.threaded:
-                # If threaded, run in this thread
-                result = func(params)
-            else:
-                # Else, start the update in a separate process.
-                result = Parallel.sub_process(func, params)
-                # print("Received result...")
-
-            if self.figure and self.handle:
-                self.figure.set(self.handle, result)
-
-    def initializeParameters(self, params):
-        # print("Initialise parameters for %s" % params)
-        self.initialized = True
-        # Register the Parameter objects
-        for p in self.paramNames:
-            # Add the parameter to own dict and register callback
-            self.params[p] = params[p]
-            self.params[p].registerCallback(lambda: self.parametersChanged())
-
-        func = None
-        if self.init is not None:
-            func = self.init
-        elif self.update is not None:
-            func = self.update
-        else:
-            return
-        if not self.updateEvent.isSet():
-            self.eventFunc = func
-            self.updateEvent.set()
-
-    def parametersChanged(self):
-        '''
-        Trigger update
-        '''
-        print("Parameters changed")
-        if self.update is None: return
-        if not self.updateEvent.isSet():
-            self.eventFunc = self.update
-            self.updateEvent.set()
 
 
 def exit_gracefully(signum, frame):
