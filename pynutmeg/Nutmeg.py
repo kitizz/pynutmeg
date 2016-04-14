@@ -167,13 +167,13 @@ class Nutmeg:
             self.task_count += 1
 
             # Send message
-            print("Sending:", "Nutmeg")
+            # print("Sending:", "Nutmeg")
             self.pubsock.send(b"Nutmeg", flags=zmq.SNDMORE)
-            print("Sending:", msg)
+            # print("Sending:", msg)
             self.pubsock.send_json(msg, flags=zmq.SNDMORE)
             # Then data
             for data in binary_data:
-                print("Sending binary")
+                # print("Sending binary")
                 self.pubsock.send(data, flags=zmq.SNDMORE, copy=True)
 
             # Makes code nicer just simply having a "null message"
