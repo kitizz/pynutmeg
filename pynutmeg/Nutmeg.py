@@ -23,7 +23,7 @@ _timeout = 2000
 
 
 def init(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
-    _core(address, port, timeout, force)
+    _core(address, pub_port, sub_port, timeout, force)
 
 
 def _core(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
@@ -304,7 +304,7 @@ class Figure(NutmegObject):
         else:
             qml = guiDef
 
-        self.nutmeg.set_gui(qml)
+        self.nutmeg.set_gui(self.handle, qml)
 
     def updateParameter(self, param, value):
         # print("Update Parameter:", param, value)
