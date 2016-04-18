@@ -1,3 +1,5 @@
+import Nutmeg 0.1
+
 Figure {
     
     Axis {

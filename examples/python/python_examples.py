@@ -52,6 +52,11 @@ def _testImages():
     imData = im.read()
     fig.set('ax.im.binary', imData)
 
+    np.savez('path', x=[...], y=[...])
+    F = np.load('path')
+    x = F['x']
+    y = F['y']
+
 
 def _testDelta():
     Nutmeg.init()

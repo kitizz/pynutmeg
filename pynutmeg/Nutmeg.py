@@ -9,6 +9,9 @@ import sys
 import threading
 import time
 
+import queue
+from collections import OrderedDict
+
 import signal
 
 import uuid
@@ -20,22 +23,26 @@ _address = "tcp://localhost"
 _pubport = 43686
 _subport = _pubport + 1
 _timeout = 2000
+_sync = False
+
+# TODO: Handle ipc://...
 
 
-def init(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
-    _core(address, pub_port, sub_port, timeout, force)
+def init(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, sync=_sync, force=False):
+    _core(address, pub_port, sub_port, timeout, sync, force)
 
 
-def _core(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, force=False):
+def _core(address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, sync=_sync, force=False):
     global _nutmegCore
 
     if _nutmegCore is None or force:
-        _nutmegCore = Nutmeg(address, pub_port, sub_port, timeout)
+        _nutmegCore = Nutmeg(address, pub_port, sub_port, timeout, sync)
 
     elif address != _address or \
             pub_port != _pubport or \
             sub_port != _subport or \
-            timeout != _timeout:
+            timeout != _timeout or \
+            sync != _sync:
         print("WARNING: Module's Nutmeg core already exists with different settings. For multiple instances, manually instantiate a Nutmeg.Nutmeg(...) object.")
 
     return _nutmegCore
@@ -95,8 +102,18 @@ class QMLException(Exception):
     pass
 
 
+class NutmegError(Exception):
+    def __init__(self, name, message, **kwargs):
+        self.name = name
+        self.message = message
+
+
 class NutmegException(Exception):
-    pass
+    def __init__(self, errors):
+        self.errors = errors
+        self.messages = [ '\t{}: {}'.format(err.name, err.message) for err in errors ]
+        self.message = "One or more errors in Nutmeg:\n" + '\n\n'.join(self.messages)
+        Exception.__init__(self, self.message)
 
 
 # Threaded decorator
@@ -110,7 +127,7 @@ def _threaded(fn):
 
 class Nutmeg:
 
-    def __init__(self, address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, pingperiod=10000):
+    def __init__(self, address=_address, pub_port=_pubport, sub_port=_subport, timeout=_timeout, sync=_sync, pingperiod=10000):
         '''
         :param timeout: Timeout in ms
         '''
@@ -121,48 +138,175 @@ class Nutmeg:
         self.pub_address = address + ":" + str(pub_port)
         self.sub_address = address + ":" + str(sub_port)
         self.timeout = timeout
+        self.sync = sync
 
         self.task_count = 0
         self.session = uuid.uuid1()
+        self.session_str = '{{{}}}'.format(self.session)
+        self.session_bytes = bytes( self.session_str, 'utf-8' )
 
         # Create the socket and connect to it.
         self.running = True
         self.context = zmq.Context()
         self.pubsock = None
+        self.subsock = None
         self.poller = None
-        self.reset_socket()
+        self.reset_sub = False
+        self.sub_running = False
 
         self.socket_lock = threading.Lock()
+        self.state_lock = threading.Lock()
 
         self.figures = {}
+        self.parameters = {}
+
+        self.tasks = {}
+        self.state = OrderedDict()
+        self.error_queue = queue.Queue()
+        self.state_requested = False
+        self.first_good_task = -1
+
+        # Fire it up
+        self.reset_socket()
 
     def reset_socket(self):
         # Close things if necessary
         if self.pubsock is not None:
-            # if self.poller is not None:
-            #     self.poller.unregister(self.pubsock)
             self.pubsock.close()
 
+        print("Nutmeg connecting")
+        print("\tPublishing to:", self.pub_address)
         self.pubsock = self.context.socket(zmq.PUB)
         # self.socket.setsockopt(zmq.LINGER, 0)
-        print("Publishing to:", self.pub_address)
         self.pubsock.connect(self.pub_address)
 
-        # self.poller = zmq.Poller()
-        # self.poller.register(self.socket, zmq.POLLIN)
+        if not self.sub_running:
+            self.sub_running = True
+            self._subscribe()
+        else:
+            self.reset_sub = True
 
         # # Last time a disconnection occurred
         # self.disconnected_t = time.time()
         self.running = True
+        self._poke_server()
 
     def ready(self):
         return self.running
+
+    @_threaded
+    def _poke_server(self):
+        '''
+        Poke the server until we get a pong, or the state is requested.
+        '''
+        msg = dict(command="Ping", target="", args=[])
+        for i in range(100):
+            task = self.publish_message(msg)
+            if self.state_requested or task.wait(0.01):
+                break
+
+    @_threaded
+    def _subscribe(self):
+        while True:
+            if self.subsock is None:
+                self.subsock = self.context.socket(zmq.SUB)
+                # Subscribe to 'Nutmeg' and this session's unique ID
+                # 'Nutmeg' is used when attempting to communicate to all connected clients.
+                self.subsock.setsockopt(zmq.SUBSCRIBE, b'Nutmeg')
+                self.subsock.setsockopt(zmq.SUBSCRIBE, self.session_bytes)
+                # Time out 100ms when checking if there are new messages coming in:
+                self.subsock.RCVTIMEO = 100
+                self.subsock.connect(self.sub_address)
+                print('\tSubscribed to: "{}"'.format(self.session_str))
+
+            try:
+                # Logic for reading in new messages
+                full_msg = []
+                full_msg.append(self.subsock.recv())
+                full_msg.append(self.subsock.recv_json())
+                while self.subsock.getsockopt(zmq.RCVMORE):
+                    full_msg.append(self.subsock.recv())
+
+            except zmq.ZMQError as e:
+                # Time out to allow us to check if the sub socket needs to be closed
+                if e.errno != zmq.EAGAIN:
+                    # Not a timeout (not good)
+                    print("Error in ZMQ")
+                    print(e)
+                    time.sleep(1)
+            else:
+                # Process the message that was received
+                msg = full_msg[1]
+                mtype = msg['messageType']
+
+                if mtype == 'parameterUpdated':
+                    self.update_parameter(msg)
+
+                elif mtype == 'requestState':
+                    print("State Requested from:", full_msg[0])
+                    self.first_good_task = self.task_count
+                    self.state_requested = True
+                    self.send_state()
+
+                elif mtype == 'success':
+                    self._task_done(msg['id'])
+
+                elif mtype == 'error':
+                    self._task_done(msg['id'])
+                    # if self.state_requested and msg['id'] >= self.first_good_task:
+                    self.error_queue.put(msg)
+
+            if self.reset_sub:
+                # Close and delete the socket if a reset was flagged
+                self.subsock.close()
+                self.subsock = None
+                self.reset_sub = False
+
+    def check_errors(self):
+        errors = []
+        while not self.error_queue.empty():
+            err_msg = self.error_queue.get_nowait()
+            errors.append( NutmegError(err_msg['errorName'], err_msg['message']) )
+
+        if len(errors) > 0:
+            raise NutmegException(errors)
+
+    def _task_done(self, task_id):
+        task = self.tasks.pop(task_id)
+        task.done.set()
+
+    def update_state(self, msg, target=None):
+        self.state_lock.acquire()
+
+        try:
+            if target is None:
+                target = msg['target']
+            if target in self.state:
+                del self.state[target]
+
+            self.state[target] = msg
+
+        finally:
+            self.state_lock.release()
+
+    def update_parameter(self, msg):
+        figure_handle = msg['figureHandle']
+        name = msg['parameter']
+        param = self.parameter(figure_handle, name)
+        param.update_value(msg['value'])
+
+        # Put this in the current state so that it is restored
+        target = '{}.{}.value'.format(figure_handle, name)
+        msg = dict(command="SetParam", target=target, args=[msg['value']])
+        self.update_state(msg)
 
     def _publish(self, msg, binary_data):
         # Check socketlock
         self.socket_lock.acquire()
         try:
             # Inject task ID (thread safe in here)
+            task = Task(self, self.task_count)
+            self.tasks[self.task_count] = task
             msg['id'] = self.task_count
             self.task_count += 1
 
@@ -179,25 +323,42 @@ class Nutmeg:
             # Makes code nicer just simply having a "null message"
             self.pubsock.send(b'')
 
+            return task
+
         except IOError:
             raise
 
         finally:
             self.socket_lock.release()
 
-    # @_threaded
     def publish_message(self, msg):
         '''
         Process the message for numpy arrays and convert them to Nutmeg-ready
         message data before sending
         '''
+        self.check_errors()
+        if not self.state_requested and msg['command'] != 'Ping':
+            task = Task(self, -1)
+            task.done.set()
+            return task
+
         msg, binary_header, binary_data = to_nutmeg_message(msg)
         msg['binary'] = binary_header
-        msg['session'] = str(self.session)
+        msg['session'] = self.session_str
 
-        self._publish(msg, binary_data)
+        return self._publish(msg, binary_data)
 
-    def figure(self, handle, figureDef, sync=True):
+    def ping(self, sync=None):
+        if sync is None:
+            sync = self.sync
+
+        msg = dict(command="Ping", target="", args=[])
+        task = self.publish_message(msg)
+
+        if sync:
+            task.wait()
+
+    def figure(self, handle, figureDef):
         # We're going by the interesting assumption that a file path cannot be
         # used to define a QML layout...
         qml = ""
@@ -212,35 +373,115 @@ class Nutmeg:
             qml = figureDef
 
         msg = dict(command="SetFigure", target=handle, args=[qml])
-        self.publish_message(msg)
+        self.update_state(msg)
+        task = self.publish_message(msg)
 
-        return Figure(self, handle, address=self.host, pub_port=self.pub_port, qml=qml)
+        fig = Figure(self, handle, address=self.host, pub_port=self.pub_port, qml=qml)
+
+        if self.sync:
+            task.wait()
+            self.check_errors()
+
+        return fig
 
     def set_gui(self, handle, qml):
+        '''
+        Set the Gui definition of the Figure with handle, `handle`.
+        :param handle: Handle of Figure
+        :param qml: Full QML definition of Gui
+        '''
         msg = dict(command="SetGui", target=handle, args=[qml])
-        self.publish_message(msg)
+        self.update_state(msg, target='{}.GUI'.format(handle))
+        task = self.publish_message(msg)
 
-    def set_property(self, handle, value):
+        if self.sync:
+            task.wait()
+            self.check_errors()
+
+    def set_property(self, handle, value, sync=None):
         '''
         Set property at handle
         '''
+        if sync is None:
+            sync = self.sync
+
         msg = dict(command="SetProperty", target=handle, args=[value])
-        self.publish_message(msg)
+        self.update_state(msg)
+        task = self.publish_message(msg)
+
+        if sync:
+            task.wait()
+            self.check_errors()
+        return task
 
     def set_properties(self, handle, **properties):
+        tasks = []
         for name, value in properties.items():
-            self.set_property('.'.join((handle, name)), value)
+            tasks.append( self.set_property('.'.join((handle, name)), value, False) )
 
-    def set_parameter(self, handle, value):
+        if self.sync:
+            for task in tasks:
+                task.wait()
+            self.check_errors()
+
+    def set_parameter(self, handle, value, sync=None):
         '''
-        Set property at handle
+        Set Gui property at handle
         '''
+        if sync is None:
+            sync = self.sync
+
         msg = dict(command="SetParam", target=handle, args=[value])
-        self.publish_message(msg)
+        self.update_state(msg)
+        task = self.publish_message(msg)
+
+        if sync:
+            task.wait()
+            self.check_errors()
 
     def set_parameters(self, handle, **params):
+        tasks = []
         for name, value in params.items():
-            self.set_parameter('.'.join(handle, name), value)
+            tasks.append( self.set_parameter('.'.join(handle, name), value, False) )
+
+        if self.sync:
+            for task in tasks:
+                task.wait()
+            self.check_errors()
+
+    def parameter(self, handle, param):
+        key = '.'.join((handle, param))
+        if key not in self.parameters:
+            self.parameters[key] = Parameter(handle, param, nutmeg=self)
+
+        return self.parameters[key]
+
+    def send_state(self):
+        '''
+        Send a full update of the current local state of properties and figures.
+        This excludes any method invokations.
+        '''
+        self.state_lock.acquire()
+
+        try:
+            for target, msg in self.state.items():
+                print("Updating state for:", target)
+                self.publish_message(msg)
+
+        finally:
+            self.state_lock.release()
+
+
+class Task(object):
+    def __init__(self, nutmeg, task_id):
+        self.nutmeg = nutmeg
+        self.task_id = task_id
+
+        self.done = threading.Event()
+        self.done.clear()
+
+    def wait(self, timeout=None):
+        return self.done.wait(timeout)
 
 
 class NutmegObject(object):
@@ -263,38 +504,8 @@ class Figure(NutmegObject):
         self.parameters = {}
         self.updates = {}
         self.address = address
-        # self.updateAddress = address + ":" + str(port)
-        # self._setlock = threading.Lock()
 
-        self.sent = False
-        # self.send()
-
-    @_threaded
-    def _waitForUpdates(self):
-        self.updateSocket = self.nutmeg.context.socket(zmq.REQ)
-        print("Connecting to socket at: %s" % self.updateAddress)
-        self.updateSocket.connect(self.updateAddress)
-        print("Connected")
-
-        while True:
-            # print("Send socket ready")
-            self.updateSocket.send(b"ready")
-
-            msg = self.updateSocket.recv_json()
-            command = msg[0]
-            # print("Received update %s" % msg)
-
-            if command == 'updateParam':
-                figureHandle, parameter, value = msg[1:4]
-                self.updateParameter(parameter, value)
-
-            elif command == 'ping':
-                time.sleep(0.01)
-
-            elif command == 'exception':
-                print("TODO: Handle exceptions here...")
-
-    def setGui(self, guiDef):
+    def set_gui(self, guiDef):
         # We're going by the interesting assumption that a file path cannot be
         # used to define a QML layout...
         qml = ""
@@ -306,31 +517,22 @@ class Figure(NutmegObject):
 
         self.nutmeg.set_gui(self.handle, qml)
 
-    def updateParameter(self, param, value):
-        # print("Update Parameter:", param, value)
-        self.parameters[param].updateValue(value)
-
-        # Call updates if there are any attached to this parameter
-        if param not in self.updates:
-            return
-        updatesToCall = self.updates[param]
-
-        # We use a set so updates aren't initialised multiple times
-        for update in updatesToCall:
-            update.parametersChanged(self.parameters, param)
-
     def parameter(self, param):
-        return self.parameters[param]
+        return self.nutmeg.parameter(self.handle, param)
 
     def set(self, handle, *value, **properties):
         '''
         Set the properties in `handle` according to the provided dictionary of
         properties and their values.
 
-        For example: figure.set('ax[1].data', {'x': range(10), 'y': someData})
+        For example:
+        ```figure.set('ax.data.x', range(10))```
+        or
+        ```figure.set('ax.data', x=range(10), y=someData})```
 
         :param handle: A string to the object or property of interest
-        :param properties: A dictionary mapping properties to values or just the property values themselves. If `properties` is not a dictionary, Nutmeg will assume that `handle` points directly to a property.
+        :param *value: The first value is used to set the property at `handle`. If this is empty, **properties is used
+        :param **properties: Each keyword describes a property in `handle` to set. These properties are set the values paired to their respective keywords.
         '''
         full_handle = self.handle + "." + handle
 
@@ -345,44 +547,20 @@ class Figure(NutmegObject):
         else:
             self.nutmeg.set_properties(full_handle, **properties)
 
-    def set_parameters(self, **params):
-        self.nutmeg.set_parameters(self.handle, **params)
-
-    def set_parameter_properties(self, param, **properties):
-        handle = self.handle + '.' + param
-        self.nutmeg.set_parameters(handle, **properties)
-
-    # def register_update(self, update, handle=""):
-    #     # The update needs to know the figure and handle of the targets
-    #     update.handle = handle
-    #     update.figure = self
-    #     # Add update to the list for each registered parameter
-    #     requiredParamsLoaded = True
-    #     for param in update.params:
-    #         if param not in self.updates:
-    #             self.updates[param] = []
-    #         self.updates[param].append(update)
-    #         # Check if this parameter is loaded
-    #         if requiredParamsLoaded and param not in self.parameters:
-    #             requiredParamsLoaded = False
-
-    #     if requiredParamsLoaded:
-    #         update.initializeParameters(self.parameters)
-
 
 class Parameter():
     '''
-    Keep track of a parameter's value and state. Currently, the parameter
-    cannot be modified from Python.
+    Keep track of a parameter's value and state.
     '''
-    def __init__(self, name, value=0, changed=0, figure=None):
+    def __init__(self, figure_handle, name, value=0, changed=0, nutmeg=None):
+        self.figure_handle = figure_handle
         self.name = name
         self.value = value
         self._changed = changed
         self.callbacks = []
         self.valueLock = threading.Lock()
         self.changedLock = threading.Lock()
-        self.figure = figure
+        self.nutmeg = nutmeg
 
     @property
     def changed(self):
@@ -392,12 +570,12 @@ class Parameter():
     def changed(self, value):
         self.changedLock.acquire()
         self._changed = value
-        if value == True:
+        if value:
             for callback in self.callbacks:
                 callback()
         self.changedLock.release()
 
-    def updateValue(self, value):
+    def update_value(self, value):
         self.valueLock.acquire()
         self.value = value
         self.changed += 1
@@ -410,9 +588,18 @@ class Parameter():
         self.changed = 0
         return self.value
 
+    def read_changed(self):
+        '''
+        Return whether the value of the parameter has changed, and set changed to false.
+        Useful for Button types where you might not care about the actual value.
+        '''
+        value = self.changed
+        self.changed = 0
+        return value
+
     def set(self, *value, **properties):
-        if self.figure is None:
-            print("WARNING: Figure of parameter is None")
+        if self.nutmeg is None:
+            print("WARNING: Core Nutmeg object of parameter is None")
             return
 
         if len(value) == 0 and len(properties) == 0:
@@ -422,13 +609,14 @@ class Parameter():
             print("WARNING: Keyword properties of parameter.set() override ordered args.")
 
         if len(properties) > 0:
-            self.figure.set_parameter_properties(self.name, **properties)
+            target = '{}.{}'.format(self.figure_handle, self.name)
+            self.nutmeg.set_parameters(self.name, **properties)
 
         elif len(value) > 0:
-            kwargs = { self.name: value[0] }
-            self.figure.set_parameters(**kwargs)
+            target = '{}.{}.value'.format(self.figure_handle, self.name)
+            self.nutmeg.set_parameter(target, value[0])
 
-    def registerCallback(self, callback):
+    def register_callback(self, callback):
         '''
         Call this function whenever the value is changed.
         '''
