@@ -52,8 +52,8 @@ def initialized():
     return _nutmegCore is not None and _nutmegCore.initialized
 
 
-def figure(handle, figureDef, sync=True):
-    return _core().figure(handle, figureDef, sync)
+def figure(handle, figureDef):
+    return _core().figure(handle, figureDef)
 
 
 def ndarray_to_message(array):

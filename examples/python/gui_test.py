@@ -9,6 +9,8 @@ fig.set_gui('../gui/gui1.qml')
 sld = fig.parameter('sigma')
 btn = fig.parameter('button')
 
+fig.set('ax.bluePlot', x=[0,1,2,3,10], y=[-1,2,10,0,3])
+
 fig2 = nutmeg.figure("test2", '../figures/figure_single.qml')
 
 # Check for changes in Gui values
