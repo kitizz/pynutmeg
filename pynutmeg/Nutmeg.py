@@ -424,6 +424,20 @@ class Nutmeg:
                 task.wait()
             self.check_errors()
 
+    def invoke_method(self, handle, *args, **kwargs):
+        if 'sync' in kwargs and kwargs['sync'] is not None:
+            sync = kwargs['sync']
+        else:
+            sync = self.sync
+
+        msg = dict(command="Invoke", target=handle, args=args)
+        task = self.publish_message(msg)
+
+        if sync:
+            task.wait()
+            self.check_errors()
+        return task
+
     def set_parameter(self, handle, value, sync=None):
         '''
         Set Gui property at handle
@@ -546,6 +560,19 @@ class Figure(NutmegObject):
 
         else:
             self.nutmeg.set_properties(full_handle, **properties)
+
+    def invoke(self, handle, *args):
+        '''
+        Invoke method in at the given location with args.
+
+        For example:
+        ```figure.set('ax.data.append', [0,1,2], [5,0,9])```
+
+        :param handle: String with "address" to method.
+        :param *args: Arguments for method
+        '''
+        full_handle = self.handle + "." + handle
+        self.nutmeg.invoke_method(full_handle, *args)
 
 
 class Parameter():
