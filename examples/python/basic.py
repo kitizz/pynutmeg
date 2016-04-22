@@ -1,20 +1,17 @@
 # Code starts
-import Nutmeg
+import pynutmeg
 import numpy as np
 
-# Initialise the Nutmeg module. This connects to the core.
-Nutmeg.init()
-
 # Create the figure from a qml file
-fig = Nutmeg.figure('fig', "figure1.qml")
+fig = pynutmeg.figure('fig', '../figures/figure_single.qml')
 
 # Set the data
 randomData = np.random.standard_normal(10)
-fig.set('ax[1].red.y', randomData)
+fig.set('ax2.red.y', randomData)
 
 x = np.r_[0:10.:0.01]
 ySin = np.sin(x)
-fig.set('ax[0].green', {'x': x, 'y': ySin})
+fig.set('ax1.green', x=x, y=ySin)
 
 yTan = np.tan(x)
-fig.set('ax[2].blue', {'x': x, 'y': yTan})
+fig.set('ax3.blue', x=x, y=yTan)

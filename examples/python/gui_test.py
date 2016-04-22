@@ -1,25 +1,44 @@
 import pynutmeg
 import time
+import numpy as np
 
-nutmeg = pynutmeg.Nutmeg()
+# nutmeg = pynutmeg.Nutmeg()
 
-fig = nutmeg.figure("test", '../figures/figure_single.qml')
+fig = pynutmeg.figure("test", '../figures/figure_single.qml')
 fig.set_gui('../gui/gui1.qml')
 
+# Grab the GUI controls
 sld = fig.parameter('sigma')
 btn = fig.parameter('button')
+# Adjust the control settings
+sld.set(maximumValue=20)
 
-fig.set('ax.bluePlot', x=[0,1,2,3,10], y=[-1,2,10,0,3])
+# Define some random data and a function to process it
+data = np.random.standard_normal(1000)
+def get_y(sigma):
+    if sigma == 0:
+        return data
 
-fig2 = nutmeg.figure("test2", '../figures/figure_single.qml')
+    m = int(np.ceil(sigma))
+    N = 2*m + 1
+    # Generate hamming window
+    window = np.interp(np.linspace(-m,m,N), [-sigma, 0, sigma], [0, 1, 0])
+    window /= window.sum()
+    return np.convolve(data, window, mode='same')
+
+# Set the figure limits and initial data
+fig.set('ax', minY=-3, maxY=3)
+fig.set('ax.blue', y=data)
 
 # Check for changes in Gui values
 while True:
-    time.sleep(0.001)
-    nutmeg.check_errors()
+    time.sleep(0.005)
+    fig.nutmeg.check_errors()
 
     if sld.changed:
-        print("Sigma changed:", sld.read())
+        sigma = sld.read()
+        print("Sigma changed:", sigma)
+        fig.set('ax.blue', y=get_y(sigma))
 
     if btn.changed:
         print("Button:", btn.read())

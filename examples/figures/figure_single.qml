@@ -6,15 +6,15 @@ Figure {
         handle: "ax"
 
         LinePlot {
-            handle: "bluePlot"
+            handle: "blue"
             line { color: "#7777FF"; style: "-"; width: 4 }
         }
         LinePlot {
-            handle: "redPlot"
+            handle: "red"
             line { color: "#FF7777"; style: "-"; width: 4 }
         }
         LinePlot {
-            handle: "greenPlot"
+            handle: "green"
             line { color: "#66FF66"; style: ":"; width: 4 }
         }
     }

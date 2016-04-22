@@ -456,7 +456,7 @@ class Nutmeg:
     def set_parameters(self, handle, **params):
         tasks = []
         for name, value in params.items():
-            tasks.append( self.set_parameter('.'.join(handle, name), value, False) )
+            tasks.append( self.set_parameter('.'.join((handle, name)), value, False) )
 
         if self.sync:
             for task in tasks:
@@ -637,7 +637,7 @@ class Parameter():
 
         if len(properties) > 0:
             target = '{}.{}'.format(self.figure_handle, self.name)
-            self.nutmeg.set_parameters(self.name, **properties)
+            self.nutmeg.set_parameters(target, **properties)
 
         elif len(value) > 0:
             target = '{}.{}.value'.format(self.figure_handle, self.name)
