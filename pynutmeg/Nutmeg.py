@@ -56,6 +56,10 @@ def figure(handle, figureDef):
     return _core().figure(handle, figureDef)
 
 
+def check_errors():
+    _core().check_errors()
+
+
 def ndarray_to_message(array):
     header = dict(type=str(array.dtype), shape=array.shape)
     return header, array.tobytes()

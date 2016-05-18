@@ -16,3 +16,4 @@ while True:
     y = sigma * np.random.standard_normal()
 
     fig.invoke('ax.blue.appendY', y)
+    fig.set('ax', minY=-1, maxY=1)
