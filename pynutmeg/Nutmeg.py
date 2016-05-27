@@ -60,6 +60,10 @@ def check_errors():
     _core().check_errors()
 
 
+def wait_for_nutmeg():
+    _core().wait_for_nutmeg()
+
+
 def ndarray_to_message(array):
     header = dict(type=str(array.dtype), shape=array.shape)
     return header, array.tobytes()
@@ -256,9 +260,18 @@ class Nutmeg:
                     self._task_done(msg['id'])
 
                 elif mtype == 'error':
-                    self._task_done(msg['id'])
+                    if msg['errorName'] == 'FigureNotFoundError':
+                        print("WARNING: Figure doesn't exist", self.state_requested)
+                        guitarget = '{}.GUI'.format( msg['details']['figureName'] )
+                        print("Gui:", guitarget)
+                        if guitarget in self.state:
+                            self.publish_message(self.state[guitarget])
+                        # if self.state_requested:
+                        #     self.send_state()
                     # if self.state_requested and msg['id'] >= self.first_good_task:
-                    self.error_queue.put(msg)
+                    else:
+                        self._task_done(msg['id'])
+                        self.error_queue.put(msg)
 
             if self.reset_sub:
                 # Close and delete the socket if a reset was flagged
@@ -276,8 +289,11 @@ class Nutmeg:
             raise NutmegException(errors)
 
     def _task_done(self, task_id):
-        task = self.tasks.pop(task_id)
-        task.done.set()
+        try:
+            task = self.tasks.pop(task_id)
+            task.done.set()
+        except KeyError:
+            pass
 
     def update_state(self, msg, target=None):
         self.state_lock.acquire()
@@ -488,6 +504,13 @@ class Nutmeg:
 
         finally:
             self.state_lock.release()
+
+    def wait_for_nutmeg(self, timeout=10):
+        t0 = time.time()
+        while not self.state_requested and time.time() - t0 < timeout:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        self.check_errors()
 
 
 class Task(object):

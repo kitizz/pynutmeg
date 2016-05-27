@@ -30,15 +30,16 @@ def get_y(sigma):
 fig.set('ax', minY=-3, maxY=3)
 fig.set('ax.blue', y=data)
 
+sigma = 0
 # Check for changes in Gui values
 while True:
-    time.sleep(0.005)
+    time.sleep(0.05)
     fig.nutmeg.check_errors()
 
     if sld.changed:
         sigma = sld.read()
         print("Sigma changed:", sigma)
-        fig.set('ax.blue', y=get_y(sigma))
+    fig.set('ax.blue', y=get_y(sigma))
 
     if btn.changed:
         print("Button:", btn.read())
