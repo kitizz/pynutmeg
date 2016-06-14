@@ -651,6 +651,20 @@ class Parameter():
         self.changed = 0
         return value
 
+    def wait_changed(self, timeout=-1):
+        '''
+        timeout: Max time to wait, default -1 (forever)
+        Return true if changed, false if timeout
+        '''
+        t0 = time.time()
+        while True:
+            if self.changed:
+                self.read()
+                return True
+            if timeout >= 0 and (time.time() - t0) > timeout:
+                return False
+            time.sleep(0.001)
+
     def set(self, *value, **properties):
         if self.nutmeg is None:
             print("WARNING: Core Nutmeg object of parameter is None")
