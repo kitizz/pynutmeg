@@ -251,7 +251,7 @@ class Nutmeg:
                     self.update_parameter(msg)
 
                 elif mtype == 'requestState':
-                    print("State Requested from:", full_msg[0])
+                    print("\tState Requested from:", full_msg[0])
                     self.first_good_task = self.task_count
                     self.state_requested = True
                     self.send_state()
@@ -499,8 +499,9 @@ class Nutmeg:
 
         try:
             for target, msg in self.state.items():
-                print("Updating state for:", target)
+                # print("Updating state for:", target)
                 self.publish_message(msg)
+            print("\tViewer's state updated")
 
         finally:
             self.state_lock.release()
