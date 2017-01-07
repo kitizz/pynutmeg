@@ -562,6 +562,9 @@ class Figure(NutmegObject):
     def parameter(self, param):
         return self.nutmeg.parameter(self.handle, param)
 
+    def button(self, name):
+        return Button(self.parameter(name))
+
     def set(self, handle, *value, **properties):
         '''
         Set the properties in `handle` according to the provided dictionary of
@@ -612,6 +615,7 @@ class Parameter():
         self.name = name
         self.value = value
         self._changed = changed
+        self._inited = False
         self.callbacks = []
         self.valueLock = threading.Lock()
         self.changedLock = threading.Lock()
@@ -634,6 +638,7 @@ class Parameter():
         self.valueLock.acquire()
         self.value = value
         self.changed += 1
+        self._inited = True
         self.valueLock.release()
 
     def read(self):
@@ -690,6 +695,28 @@ class Parameter():
         Call this function whenever the value is changed.
         '''
         self.callbacks.append(callback)
+
+
+class Button(object):
+    def __init__(self, param):
+        self.param = param
+        if param._inited:
+            self.last_value = param.read()
+        else:
+            self.last_value = None
+
+    def changed(self):
+        if self.last_value is None:
+            return False
+
+        return self.param.read() != self.last_value
+
+    def read_pressed(self):
+        result = self.changed()
+        if self.param._inited:
+            self.last_value = self.param.read()
+
+        return result
 
 
 def exit_gracefully(signum, frame):
